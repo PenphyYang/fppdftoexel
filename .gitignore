@@ -1,0 +1,11 @@
+/build
+/dist
+/exe_output.xlsx
+/invoice_analysis_tool.spec
+/invoice_pdf_to_excel.spec
+/invoice_pdf_to_excel_cli.spec
+/__pycache__
+/发票-26952000000316569016（深圳市圣仁五金有限公司 价税合计69227.14元 20260126）.pdf
+/新测试输出.xlsx
+/测试输出.xlsx
+/测试输出_v2.xlsx
