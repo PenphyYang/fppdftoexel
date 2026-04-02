@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import pdfplumber
@@ -69,6 +69,10 @@ def compact_spaces(text: str) -> str:
     return re.sub(r"[ \t]+", " ", clean_text(text))
 
 
+def join_text_parts(parts: List[str]) -> str:
+    return re.sub(r"\s+", " ", " ".join(part for part in parts if part).strip())
+
+
 def to_decimal(value: str) -> Optional[Decimal]:
     try:
         return Decimal(str(value).replace(",", "").replace("¥", "").strip())
@@ -87,11 +91,13 @@ def extract_pages(pdf_path: Path) -> List[Dict[str, object]]:
         for page_number, page in enumerate(pdf.pages, start=1):
             text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
             lines = [compact_spaces(line) for line in text.splitlines() if compact_spaces(line)]
+            words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False)
             pages.append(
                 {
                     "page_number": page_number,
                     "text": clean_text(text),
                     "lines": lines,
+                    "words": words,
                 }
             )
     return pages
@@ -149,31 +155,89 @@ def should_skip_prefix_line(line: str) -> bool:
     return False
 
 
-def parse_items_from_page(lines: List[str], page_number: int, source_file: str) -> List[Dict[str, object]]:
-    items: List[Dict[str, object]] = []
-    in_detail = False
-    prefix_buffer: List[str] = []
-    last_item: Optional[Dict[str, object]] = None
+def group_words_by_line(words: List[Dict[str, object]], tolerance: float = 3.0) -> List[List[Dict[str, object]]]:
+    grouped: List[List[Dict[str, object]]] = []
+    for word in sorted(words, key=lambda item: (item["top"], item["x0"])):
+        if not grouped:
+            grouped.append([word])
+            continue
+        current_top = grouped[-1][0]["top"]
+        if abs(word["top"] - current_top) <= tolerance:
+            grouped[-1].append(word)
+        else:
+            grouped.append([word])
+    return grouped
 
-    for line in lines:
-        if not in_detail:
-            if re.search(r"项目名称.*税\s*额", line):
-                in_detail = True
+
+def find_column_starts(words: List[Dict[str, object]]) -> Optional[Dict[str, float]]:
+    spec_word = next((w for w in words if w["text"] == "规格型号"), None)
+    unit_words = [w for w in words if w["text"] in {"单", "位"}]
+    qty_words = [w for w in words if w["text"] in {"数", "量"}]
+    price_words = [w for w in words if w["text"] in {"单", "价"} and w["x0"] > 300]
+    amount_words = [w for w in words if w["text"] in {"金", "额"} and 380 <= w["x0"] <= 440]
+    tax_words = [w for w in words if w["text"] in {"税", "额"} and w["x0"] > 540]
+
+    if not spec_word or not unit_words or not qty_words:
+        return None
+
+    return {
+        "spec_start": float(spec_word["x0"]) - 8.0,
+        "unit_start": min(float(w["x0"]) for w in unit_words),
+        "qty_start": min(float(w["x0"]) for w in qty_words),
+        "price_start": min(float(w["x0"]) for w in price_words) if price_words else 330.0,
+        "amount_start": min(float(w["x0"]) for w in amount_words) if amount_words else 400.0,
+        "tax_rate_start": 446.0,
+        "tax_amount_start": min(float(w["x0"]) for w in tax_words) if tax_words else 550.0,
+    }
+
+
+def parse_line_from_columns(line_words: List[Dict[str, object]], columns: Dict[str, float]) -> Dict[str, str]:
+    parts = {
+        "description": [],
+        "spec_model": [],
+    }
+
+    for word in sorted(line_words, key=lambda item: item["x0"]):
+        x0 = float(word["x0"])
+        text = clean_text(word["text"])
+        if x0 < columns["spec_start"]:
+            parts["description"].append(text)
+        elif x0 < columns["unit_start"]:
+            parts["spec_model"].append(text)
+
+    return {key: join_text_parts(value) for key, value in parts.items()}
+
+
+def parse_items_from_page(
+    page: Dict[str, object],
+    source_file: str,
+    carry_item: Optional[Dict[str, object]] = None,
+) -> Tuple[List[Dict[str, object]], Optional[Dict[str, object]]]:
+    items: List[Dict[str, object]] = []
+    columns = find_column_starts(page["words"])
+    if not columns:
+        return items, carry_item
+
+    page_number = int(page["page_number"])
+    last_item: Optional[Dict[str, object]] = carry_item
+
+    for line_words in group_words_by_line(page["words"]):
+        line_text = join_text_parts([clean_text(word["text"]) for word in sorted(line_words, key=lambda item: item["x0"])])
+        if re.search(r"项目名称.*税\s*额", line_text):
+            continue
+        if any(marker in line_text for marker in DETAIL_END_MARKERS):
+            break
+        if should_skip_prefix_line(line_text):
             continue
 
-        if any(marker in line for marker in DETAIL_END_MARKERS):
-            break
-
-        match = ITEM_LINE_RE.match(line)
+        row = parse_line_from_columns(line_words, columns)
+        match = ITEM_LINE_RE.match(line_text)
         if match:
-            description_parts = prefix_buffer + [match.group("body")]
-            prefix_buffer = []
-            description = " ".join(part for part in description_parts if part).strip()
-            description = re.sub(r"\s+", " ", description)
             item = {
                 "source_file": source_file,
                 "page_number": page_number,
-                "description": description,
+                "description": row["description"],
+                "spec_model": row["spec_model"],
                 "unit": match.group("unit"),
                 "quantity": to_float(match.group("qty")),
                 "unit_price": to_float(match.group("unit_price")),
@@ -185,15 +249,15 @@ def parse_items_from_page(lines: List[str], page_number: int, source_file: str) 
             last_item = item
             continue
 
-        if should_skip_prefix_line(line):
-            continue
-
         if last_item is not None:
-            last_item["description"] = f"{last_item['description']} {line}".strip()
-        else:
-            prefix_buffer.append(line)
+            if row["spec_model"]:
+                last_item["spec_model"] = join_text_parts([last_item["spec_model"], row["spec_model"]])
+            elif row["description"]:
+                last_item["description"] = join_text_parts([last_item["description"], row["description"]])
+            else:
+                last_item["description"] = join_text_parts([last_item["description"], line_text])
 
-    return items
+    return items, last_item
 
 
 def parse_invoice(pdf_path: Path) -> InvoiceParseResult:
@@ -203,10 +267,11 @@ def parse_invoice(pdf_path: Path) -> InvoiceParseResult:
     company_info = extract_company_sections(full_text)
     totals = extract_totals(full_text)
     items: List[Dict[str, object]] = []
+    last_item: Optional[Dict[str, object]] = None
 
     for page in pages:
-        page_number = int(page["page_number"])
-        items.extend(parse_items_from_page(page["lines"], page_number, pdf_path.name))
+        page_items, last_item = parse_items_from_page(page, pdf_path.name, last_item)
+        items.extend(page_items)
 
     item_amount_sum = round(sum(item["amount"] or 0 for item in items), 2) if items else None
     item_tax_sum = round(sum(item["tax_amount"] or 0 for item in items), 2) if items else None
@@ -361,7 +426,7 @@ class InvoiceExtractorApp:
 
         tip_text = (
             "导出结果包含两个工作表：发票汇总、发票明细。\n"
-            "如果个别发票存在换行拆分或版式差异，建议抽样核对明细描述。"
+            "明细中会拆出“规格型号”单独一列，便于筛选和统计。"
         )
         ttk.Label(status_frame, text=tip_text, foreground="#555555", justify="left").pack(fill="x", pady=(10, 0))
 
