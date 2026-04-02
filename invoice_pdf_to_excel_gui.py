@@ -148,8 +148,15 @@ def should_skip_prefix_line(line: str) -> bool:
         return True
     if any(marker in line for marker in DETAIL_END_MARKERS):
         return True
-    if any(pattern == line or pattern in line for pattern in SKIP_LINE_PATTERNS):
-        return True
+    for pattern in SKIP_LINE_PATTERNS:
+        # Single-character and very short labels like “购/销/方/信/息” must match exactly,
+        # otherwise they will incorrectly filter normal detail rows.
+        if len(pattern) <= 2:
+            if pattern == line:
+                return True
+        else:
+            if pattern == line or pattern in line:
+                return True
     if line.startswith("名称：") or line.startswith("统一社会信用代码/纳税人识别号："):
         return True
     return False
